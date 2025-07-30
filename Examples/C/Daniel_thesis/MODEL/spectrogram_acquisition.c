@@ -19,6 +19,7 @@
 #include "stft_dsp.h"          // STFT code
 #include "bubble_detector.h"   // CNN (if enabled)
 
+
 // Red Pitaya sample rate and decimation
 #define SAMPLE_RATE      125000000
 #define DECIMATION       RP_DEC_256
@@ -70,6 +71,9 @@ static uint32_t frame_counter = 0;
 static STFT_Handle* stft_handle = NULL;
 static int nperseg = 256; // Sub-window size => expecting 38 sub-windows per chunk
 static int noverlap = 0;  // No overlap => hop=256
+
+//function prototype
+
 
 // Global flag for trigger-saving logic in process_buffer
 bool trigger_mode_enabled = false;
@@ -208,6 +212,8 @@ void* acquisition_thread(void* arg) {
 // This converts a spectrogram with shape [num_subwindows x orig_freq_bins]
 // (row-major order) into a new array with shape [new_freq_bins x num_subwindows]
 // using logarithmically spaced sampling along the frequency axis.
+
+/* THIS IS THE OLD LOG_SCALE_SPECTROGRAM_C FUNCTION
 static float* log_scale_spectrogram_c(const float* stft_power_db, int num_subwindows, int orig_freq_bins, int new_freq_bins) { //
     float* log_spec = (float*)malloc(new_freq_bins * num_subwindows * sizeof(float)); //
     if (!log_spec) {
@@ -243,6 +249,134 @@ static float* log_scale_spectrogram_c(const float* stft_power_db, int num_subwin
     }
     return log_spec; //
 }
+*/
+
+//---------------------------------------------------------------------
+// NEW LOG_SCALE_SPECTROGRAM_C --> CREATE_LOG_BINNING_RANGES FUNCTION WITH INTEGRATION RATHER THAN INTERPOLATION
+//--------------------------------------------------------------------- 
+// New helper function: integration-based log-scale rebinning of STFT power array.
+// This converts a spectrogram with shape [num_subwindows x orig_freq_bins]
+// (row-major order) into a new array with shape [new_freq_bins x num_subwindows]
+// using logarithmically spaced bins with integration instead of interpolation.
+//---------------------------------------------------------------------
+
+// Structure for bin ranges (add this if not already defined)
+typedef struct {
+    int start_idx;
+    int end_idx;
+} bin_range_t;
+
+static void create_log_binning_ranges(int orig_freq_bins, int new_freq_bins, 
+                                     int *bin_boundaries, bin_range_t *bin_ranges) {
+    /*
+     * Create logarithmic binning strategy for integration
+     * - Skip DC bin (index 0), work with bins 1 to (orig_freq_bins-1)
+     * - Create logarithmically spaced positions
+     */
+    
+    // Create logarithmically spaced positions in the range [1, orig_freq_bins-1]
+    double log_start = log10(1.0);
+    double log_end = log10((double)(orig_freq_bins - 1));
+    double log_step = (log_end - log_start) / new_freq_bins;
+    
+    // Generate log positions and convert to integer indices
+    for (int i = 0; i <= new_freq_bins; i++) {
+        double log_pos = log_start + i * log_step;
+        double linear_pos = pow(10.0, log_pos);
+        bin_boundaries[i] = (int)round(linear_pos);
+        
+        // Ensure we don't exceed bounds
+        if (bin_boundaries[i] < 1) bin_boundaries[i] = 1;
+        if (bin_boundaries[i] >= orig_freq_bins) bin_boundaries[i] = orig_freq_bins - 1;
+    }
+    
+    // Remove duplicates while preserving order
+    int unique_count = 1;
+    for (int i = 1; i <= new_freq_bins; i++) {
+        if (bin_boundaries[i] > bin_boundaries[unique_count - 1]) {
+            bin_boundaries[unique_count] = bin_boundaries[i];
+            unique_count++;
+        }
+    }
+    
+    // If we lost boundaries due to duplicates, spread them out
+    if (unique_count < new_freq_bins + 1) {
+        int remaining_bins = new_freq_bins + 1 - unique_count;
+        int start_idx = bin_boundaries[unique_count - 1] + 1;
+        int end_idx = orig_freq_bins - 1;
+        
+        if (start_idx <= end_idx && remaining_bins > 0) {
+            for (int i = 0; i < remaining_bins; i++) {
+                double frac = (double)(i + 1) / (remaining_bins + 1);
+                bin_boundaries[unique_count + i] = start_idx + (int)round(frac * (end_idx - start_idx));
+            }
+            unique_count += remaining_bins;
+        }
+    }
+    
+    // Create ranges for integration
+    for (int i = 0; i < new_freq_bins && i < unique_count - 1; i++) {
+        bin_ranges[i].start_idx = bin_boundaries[i];
+        bin_ranges[i].end_idx = bin_boundaries[i + 1] - 1;  // Make ranges non-overlapping
+    }
+}
+
+static float* log_scale_spectrogram_c(const float* stft_power_db, int num_subwindows, 
+                                     int orig_freq_bins, int new_freq_bins) {
+    /*
+     * Integration-based logarithmic rebinning
+     * Input: stft_power_db shape = [num_subwindows x orig_freq_bins] (row-major)
+     * Output: log_spec shape = [new_freq_bins x num_subwindows] (row-major)
+     * 
+     * Instead of interpolation, this function integrates (sums) the power
+     * within each logarithmic frequency bin.
+     */
+    
+    float* log_spec = (float*)malloc(new_freq_bins * num_subwindows * sizeof(float));
+    if (!log_spec) {
+        fprintf(stderr, "Failed to allocate memory for log-scaled spectrogram\n");
+        return NULL;
+    }
+    
+    // Initialize output to zero
+    memset(log_spec, 0, new_freq_bins * num_subwindows * sizeof(float));
+    
+    // Create bin ranges for integration
+    bin_range_t *bin_ranges = (bin_range_t*)malloc(new_freq_bins * sizeof(bin_range_t));
+    int *bin_boundaries = (int*)malloc((new_freq_bins + 1) * sizeof(int));
+    
+    if (!bin_ranges || !bin_boundaries) {
+        fprintf(stderr, "Failed to allocate memory for bin ranges\n");
+        free(log_spec);
+        if (bin_ranges) free(bin_ranges);
+        if (bin_boundaries) free(bin_boundaries);
+        return NULL;
+    }
+    
+    create_log_binning_ranges(orig_freq_bins, new_freq_bins, bin_boundaries, bin_ranges);
+    
+    // Integrate power in each logarithmic bin
+    for (int i = 0; i < new_freq_bins; i++) {
+        int start_idx = bin_ranges[i].start_idx;
+        int end_idx = bin_ranges[i].end_idx;
+        
+        if (start_idx <= end_idx) {
+            for (int j = 0; j < num_subwindows; j++) {
+                // Sum up all frequency bins within this logarithmic bin
+                for (int f = start_idx; f <= end_idx; f++) {
+                    // Original data is row-major: index = j * orig_freq_bins + f
+                    log_spec[i * num_subwindows + j] += stft_power_db[j * orig_freq_bins + f];
+                }
+            }
+        }
+    }
+    
+    // Clean up
+    free(bin_ranges);
+    free(bin_boundaries);
+    
+    return log_spec;
+}
 
 //---------------------------------------------------------------------
 // Updated process_buffer: now the STFT is re-interpolated to log-scale
@@ -252,6 +386,29 @@ static float* log_scale_spectrogram_c(const float* stft_power_db, int num_subwin
 // Then compute STFT. If saving, write to .bin. Otherwise pass to CNN (mode 0).
 //
 //---------------------------------------------------------------------
+
+void save_spectrogram_csv(float* log_power_array, int new_freq_bins, int num_subwindows, uint32_t frame_num) {
+    char filename[256];
+    snprintf(filename, sizeof(filename), "%s/spec_%06u.csv", output_directory, frame_num);
+    
+    FILE* fp = fopen(filename, "w");
+    if (!fp) {
+        fprintf(stderr, "Failed to open CSV file %s\n", filename);
+        return;
+    }
+    
+    // Write log-scaled spectrogram (513 x 38)
+    for (int freq = 0; freq < new_freq_bins; freq++) {
+        for (int time = 0; time < num_subwindows; time++) {
+            fprintf(fp, "%.6f", log_power_array[freq * num_subwindows + time]);
+            if (time < num_subwindows - 1) fprintf(fp, ",");
+        }
+        fprintf(fp, "\n");
+    }
+    fclose(fp);
+    printf("Saved CSV spectrogram %u => %s\n", frame_num, filename);
+}
+
 void process_buffer(int index) { //
     float* time_data = cbuf.buffers[index].data; //
 
@@ -313,12 +470,15 @@ void process_buffer(int index) { //
         }
     }
 
+    
+
     // 3) If in saving mode, update metadata and write the log-scaled spectrogram.
     if (cbuf.save_to_file) { //
         char filename[256]; //
         uint32_t time_offset_ms = frame_counter * 10; //
         snprintf(filename, sizeof(filename), "%s/stft_%06u.bin", output_directory, frame_counter); //
         FILE* fp = fopen(filename, "wb"); //
+        save_spectrogram_csv(log_power_array, new_freq_bins, num_subwindows, frame_counter);
         if (!fp) {
             fprintf(stderr, "process_buffer: Failed to open %s\n", filename); //
             free(log_power_array); //
@@ -372,6 +532,7 @@ void process_buffer(int index) { //
     frame_counter++; //
 }
 
+// Add this function to save spectrograms as CSV for easier Python loading
 //
 // Processing thread: waits for new data in the ring buffer, processes it
 //
@@ -415,7 +576,7 @@ int main(int argc, char** argv) { //
         // Mode 0: CNN detection, free-running
         cbuf.save_to_file     = false; //
         trigger_mode_enabled  = false; //
-        if (!detector_init(output_directory)) { //
+        if (!detector_init("weights_for_c.bin")) { //
             fprintf(stderr, "detector_init failed!\n"); //
             return 1; //
         }
